@@ -1,0 +1,9 @@
+/build/
+/out/
+/prototypes/
+/.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+MouNeru.exe.sha256
