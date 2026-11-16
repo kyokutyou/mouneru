@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(MouNeru VERSION 1.2.0 LANGUAGES CXX)
+project(MouNeru VERSION 1.2.1 LANGUAGES CXX)
 
 if(NOT WIN32)
   message(FATAL_ERROR "MouNeru supports Windows only.")
@@ -20,6 +20,7 @@ target_compile_definitions(mouneru_core PRIVATE UNICODE _UNICODE NOMINMAX WIN32_
 
 add_executable(MouNeru WIN32
   src/main.cpp
+  src/single_instance.cpp
   src/sleep_service.cpp
   src/app.rc
 )
@@ -56,7 +57,7 @@ if(MSVC)
 endif()
 add_test(NAME power_service COMMAND mouneru_power_service_tests)
 
-add_executable(mouneru_ui_tests tests/ui_tests.cpp)
+add_executable(mouneru_ui_tests tests/ui_tests.cpp src/single_instance.cpp)
 target_link_libraries(mouneru_ui_tests PRIVATE mouneru_core Comctl32 Dwmapi Gdiplus Oleacc Ole32 Uuid)
 target_compile_definitions(mouneru_ui_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 if(MSVC)
@@ -66,6 +67,38 @@ if(MSVC)
 endif()
 add_test(NAME quiet_ui COMMAND mouneru_ui_tests)
 set_tests_properties(quiet_ui PROPERTIES TIMEOUT 15)
+
+add_executable(mouneru_single_instance_tests tests/single_instance_tests.cpp src/single_instance.cpp)
+target_include_directories(mouneru_single_instance_tests PRIVATE src)
+target_compile_definitions(mouneru_single_instance_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+if(MSVC)
+  target_compile_options(mouneru_single_instance_tests PRIVATE /W4 /permissive- /utf-8)
+  set_property(TARGET mouneru_single_instance_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+add_test(NAME single_instance COMMAND mouneru_single_instance_tests)
+set_tests_properties(single_instance PROPERTIES TIMEOUT 20)
+
+add_executable(mouneru_app_lifecycle_tests
+  tests/app_lifecycle_tests.cpp
+  src/single_instance.cpp
+  src/app.rc
+)
+target_link_libraries(mouneru_app_lifecycle_tests PRIVATE mouneru_core Comctl32 Dwmapi Gdiplus Oleacc Ole32 Uuid)
+target_compile_definitions(mouneru_app_lifecycle_tests PRIVATE
+  UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN
+  MOUNERU_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+  MOUNERU_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+  MOUNERU_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+  MOUNERU_VERSION_STRING="${PROJECT_VERSION}"
+)
+if(MSVC)
+  target_compile_options(mouneru_app_lifecycle_tests PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(mouneru_app_lifecycle_tests PRIVATE /MANIFEST:NO)
+  set_property(TARGET mouneru_app_lifecycle_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+add_test(NAME app_exit_after_power_success COMMAND mouneru_app_lifecycle_tests success)
+add_test(NAME app_exit_during_sleep COMMAND mouneru_app_lifecycle_tests suspend)
+set_tests_properties(app_exit_after_power_success app_exit_during_sleep PROPERTIES TIMEOUT 5)
 
 add_custom_command(TARGET MouNeru POST_BUILD
   COMMAND "${CMAKE_COMMAND}"

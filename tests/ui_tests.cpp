@@ -1,6 +1,13 @@
 // Integrate the real Win32 controls in an isolated test window.
 // The power service is replaced at link time. This executable cannot sleep or shut down the PC.
+#include <windows.h>
+HPOWERNOTIFY WINAPI TestRegisterSuspendResume(HANDLE recipient, DWORD flags);
+BOOL WINAPI TestUnregisterSuspendResume(HPOWERNOTIFY registration);
+#define RegisterSuspendResumeNotification TestRegisterSuspendResume
+#define UnregisterSuspendResumeNotification TestUnregisterSuspendResume
 #include "../src/main.cpp"
+#undef RegisterSuspendResumeNotification
+#undef UnregisterSuspendResumeNotification
 #include <atomic>
 #include <iostream>
 #include <filesystem>
@@ -10,7 +17,9 @@ std::atomic<int> sleepRequests{};
 std::atomic<int> shutdownRequests{};
 std::atomic<bool> holdPowerRequest{};
 int failures{};
+int suspendRegistrations{}, suspendUnregistrations{};
 int dialogAnswer = IDCANCEL;
+bool suspendDuringDialog{};
 void Expect(bool condition, const char* description) {
   if (!condition) { std::cerr << "FAILED: " << description << '\n'; ++failures; }
 }
@@ -25,8 +34,14 @@ LRESULT CALLBACK AnswerOwnDialog(int code, WPARAM wParam, LPARAM lParam) {
     const HWND dialog = reinterpret_cast<HWND>(wParam);
     wchar_t type[32]{};
     GetClassNameW(dialog, type, 32);
-    if (std::wcscmp(type, L"#32770") == 0 && GetWindow(dialog, GW_OWNER) == g_app.window)
+    if (std::wcscmp(type, L"#32770") == 0 && GetWindow(dialog, GW_OWNER) == g_app.window) {
+      if (suspendDuringDialog) {
+        suspendDuringDialog = false;
+        SendMessageW(g_app.window, WM_POWERBROADCAST, PBT_APMSUSPEND, 0);
+        SendMessageW(g_app.window, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0);
+      }
       PostMessageW(dialog, WM_COMMAND, dialogAnswer, 0);
+    }
   }
   return CallNextHookEx(nullptr, code, wParam, lParam);
 }
@@ -144,7 +159,7 @@ void TestPowerSelection() {
   ScheduleFromInputs();
   HandleCommand(IdChange);
   HandleCommand(IdPowerSleep);
-  Expect(g_app.timer.Tick(g_app.timer.target()) == mouneru::TimerAction::RequestSleep,
+  Expect(g_app.timer.Tick(g_app.timer.target(), steady_clock::now() + hours{25}) == mouneru::TimerAction::RequestSleep,
          "original reservation can expire while its replacement is being edited");
   ExecutePower();
   WaitForPowerResult();
@@ -161,7 +176,7 @@ void TestSuspendDuringShutdown() {
   HandleCommand(IdSleepNow);
   const int initialRequests = shutdownRequests;
   holdPowerRequest = true;
-  Expect(g_app.timer.Tick(g_app.timer.target()) == mouneru::TimerAction::RequestSleep,
+  Expect(g_app.timer.Tick(g_app.timer.target(), steady_clock::now() + hours{25}) == mouneru::TimerAction::RequestSleep,
          "shutdown timer reaches execution before suspend notification");
   ExecutePower();
   SendMessageW(g_app.window, WM_POWERBROADCAST, PBT_APMSUSPEND, 0);
@@ -170,11 +185,90 @@ void TestSuspendDuringShutdown() {
          "external suspend cannot close an in-flight shutdown request");
   holdPowerRequest = false;
   WaitForPowerResult();
+  SendMessageW(g_app.window, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0);
   Expect(stayedOpen && shutdownRequests == initialRequests + 1 &&
          g_app.timer.state() == mouneru::TimerState::Idle &&
          Text(IdError).find(L"シャットダウン") != std::wstring::npos,
          "shutdown failure remains visible after unrelated suspend notification");
   HandleCommand(IdPowerSleep);
+  ClearErrors();
+}
+void TestExternalSuspendCancelsReservations() {
+  const int initialSleepRequests = sleepRequests;
+  const int initialShutdownRequests = shutdownRequests;
+  for (int power : {IdPowerSleep, IdPowerShutdown}) {
+    for (int timerKind : {0, 1, 2}) {
+      HandleCommand(timerKind == 1 ? IdModeClock : IdModeMinutes);
+      HandleCommand(power);
+      if (timerKind == 2) HandleCommand(IdSleepNow);
+      else ScheduleFromInputs();
+      Expect(g_app.timer.HasActiveTimer(), "reservation is active before external suspend");
+      const auto oldTarget = g_app.timer.target();
+      SendMessageW(g_app.window, WM_POWERBROADCAST, PBT_APMSUSPEND, 0);
+      Expect(IsWindow(g_app.window) && !g_app.timer.HasActiveTimer(),
+             "external suspend cancels every unexecuted sleep/shutdown reservation");
+      SendMessageW(g_app.window, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0);
+      SendMessageW(g_app.window, WM_POWERBROADCAST, PBT_APMRESUMESUSPEND, 0);
+      Expect(g_app.timer.Tick(oldTarget + hours{2}, steady_clock::now() + hours{25}) == mouneru::TimerAction::None,
+             "an overdue reservation never executes after external suspend/resume");
+      g_app.timer.CompleteExecution(); // Isolate the next case even if the assertion fails.
+      RefreshUi();
+    }
+  }
+  HandleCommand(IdModeMinutes);
+  HandleCommand(IdPowerSleep);
+  ScheduleFromInputs();
+  HandleCommand(IdChange);
+  SendMessageW(g_app.window, WM_POWERBROADCAST, PBT_APMSUSPEND, 0);
+  SendMessageW(g_app.window, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0);
+  Expect(!g_app.editing && EditorVisible() && !g_app.timer.HasActiveTimer(),
+         "suspend cancels the original reservation while its replacement is being edited");
+  g_app.timer.CompleteExecution();
+  g_app.editing = false;
+  RefreshUi();
+  Expect(sleepRequests == initialSleepRequests && shutdownRequests == initialShutdownRequests,
+         "suspend/resume cancellation sends no power request");
+  ClearErrors();
+}
+void TestResumeAndConfirmationCannotRestoreOldReservations() {
+  ScheduleFromInputs();
+  SendMessageW(g_app.window, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0);
+  Expect(!g_app.timer.HasActiveTimer(), "resume alone cancels reservations if suspend notification was missed");
+  ScheduleFromInputs();
+  const auto newTarget = g_app.timer.target();
+  SendMessageW(g_app.window, WM_POWERBROADCAST, PBT_APMRESUMESUSPEND, 0);
+  Expect(g_app.timer.HasActiveTimer() && g_app.timer.target() == newTarget,
+         "a later user-present notification preserves a fresh reservation made after resume");
+  HandleCommand(IdChange);
+  HandleCommand(IdPreset60);
+  dialogAnswer = IDOK;
+  suspendDuringDialog = true;
+  ScheduleFromInputs();
+  Expect(!suspendDuringDialog && !g_app.timer.HasActiveTimer() && !g_app.editing,
+         "accepting a pre-suspend confirmation cannot recreate a cancelled reservation");
+  const int before = sleepRequests + shutdownRequests;
+  for (int i = 0; i < 100; ++i) SendMessageW(g_app.window, WM_TIMER, kTickTimer, 0);
+  Expect(sleepRequests + shutdownRequests == before && !g_app.timer.HasActiveTimer(),
+         "queued timer messages after resume cannot recreate or execute an old reservation");
+  dialogAnswer = IDCANCEL;
+  HandleCommand(IdPreset30);
+  ClearErrors();
+}
+void TestUiUsesMonotonicRelativeTimers() {
+  HandleCommand(IdPreset30);
+  ScheduleFromInputs();
+  const auto now = system_clock::now();
+  const auto steadyNow = steady_clock::now();
+  Expect(g_app.timer.Tick(now + hours{1}, steadyNow) == mouneru::TimerAction::None,
+         "real UI minute scheduling ignores a forward wall-clock change");
+  Expect(g_app.timer.Remaining(now + hours{1}, steadyNow) > minutes{29},
+         "remaining time for a UI minute reservation ignores a forward wall-clock change");
+  HandleCommand(IdCancel);
+  HandleCommand(IdSleepNow);
+  Expect(g_app.timer.Tick(now - hours{1}, steadyNow + seconds{6}) == mouneru::TimerAction::RequestSleep,
+         "real UI five-second countdown expires after elapsed time despite backward wall-clock change");
+  g_app.timer.CompleteExecution();
+  RefreshUi();
   ClearErrors();
 }
 void SendDialogKey(UINT message, WPARAM key, bool shift = false) {
@@ -327,6 +421,16 @@ void SaveRender(const std::filesystem::path& file) {
   ReleaseDC(g_app.window, dc);
 }
 } // namespace
+HPOWERNOTIFY WINAPI TestRegisterSuspendResume(HANDLE recipient, DWORD flags) {
+  ++suspendRegistrations;
+  Expect(flags == DEVICE_NOTIFY_WINDOW_HANDLE && IsWindow(static_cast<HWND>(recipient)),
+         "suspend/resume notifications subscribe the real application window");
+  return RegisterSuspendResumeNotification(recipient, flags);
+}
+BOOL WINAPI TestUnregisterSuspendResume(HPOWERNOTIFY registration) {
+  ++suspendUnregistrations;
+  return UnregisterSuspendResumeNotification(registration);
+}
 namespace mouneru {
 PowerResult RequestSystemPower(PowerAction action) noexcept {
   if (action == PowerAction::Shutdown) ++shutdownRequests;
@@ -345,6 +449,7 @@ int wmain(int argc, wchar_t** argv) {
   if (Gdiplus::GdiplusStartup(&token, &input, nullptr) != Gdiplus::Ok) return 1;
   HWND window = CreateAppWindow(GetModuleHandleW(nullptr));
   if (!window) { std::cerr << "Cannot create test window\n"; return 1; }
+  Expect(suspendRegistrations == 1, "application opts in to suspend/resume notifications for modern standby");
   KillTimer(window, kTickTimer); // Tests advance the timer explicitly; no real-time execution.
   HHOOK hook = SetWindowsHookExW(WH_CBT, AnswerOwnDialog, nullptr, GetCurrentThreadId());
   Expect(hook != nullptr, "own-thread dialog test hook available");
@@ -358,6 +463,9 @@ int wmain(int argc, wchar_t** argv) {
   ShowWindow(window, SW_SHOWNOACTIVATE);
   TestPowerSelection();
   TestSuspendDuringShutdown();
+  TestExternalSuspendCancelsReservations();
+  TestResumeAndConfirmationCannotRestoreOldReservations();
+  TestUiUsesMonotonicRelativeTimers();
   TestRadioKeyboardNavigation();
   HandleCommand(IdPowerShutdown);
   snapshot(L"power-shutdown.png");
@@ -461,7 +569,7 @@ int wmain(int argc, wchar_t** argv) {
   SendMessageW(Control(IdCancel), WM_KEYDOWN, VK_ESCAPE, 0);
   Expect(g_app.timer.state() == mouneru::TimerState::Idle && sleepRequests == 0, "Escape cancels without requesting sleep");
   HandleCommand(IdSleepNow);
-  Expect(g_app.timer.Tick(g_app.timer.target()) == mouneru::TimerAction::RequestSleep, "immediate timer reaches execution");
+  Expect(g_app.timer.Tick(g_app.timer.target(), steady_clock::now() + seconds{6}) == mouneru::TimerAction::RequestSleep, "immediate timer reaches execution");
   RefreshUi();
   Expect(!IsWindowEnabled(Control(IdCancel)), "executing cannot be cancelled");
   ExecutePower(); // Linked stub; this does not call any OS power API.
@@ -479,6 +587,7 @@ int wmain(int argc, wchar_t** argv) {
   dialogAnswer = IDOK;
   SendMessageW(window, WM_CLOSE, 0, 0);
   Expect(!IsWindow(window), "confirmed exit closes the window");
+  Expect(suspendUnregistrations == 1, "window destruction releases its suspend/resume notification registration");
   UnhookWindowsHookEx(hook);
   Gdiplus::GdiplusShutdown(token);
   if (SUCCEEDED(com)) CoUninitialize();
