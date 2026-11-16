@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "sleep_service.h"
+#include "single_instance.h"
 #include "timer_manager.h"
 
 namespace {
@@ -49,6 +50,7 @@ struct Palette {
 struct AppState {
   mouneru::TimerManager timer;
   HWND window{};
+  HPOWERNOTIFY suspendResumeNotification{};
   HFONT fonts[6]{};
   HBRUSH paperBrush{};
   InputMode mode{InputMode::Minutes};
@@ -56,6 +58,8 @@ struct AppState {
   mouneru::PowerAction reservedPower{mouneru::PowerAction::Sleep};
   struct WorkerRequest { HWND window; mouneru::PowerAction action; } workerRequest{};
   bool editing{}, powerRequestInFlight{}, refreshing{}, confirmationOpen{};
+  bool systemSuspended{};
+  ULONGLONG powerTransitionGeneration{};
   bool selectionReady{}, selections[5]{};
   std::vector<ControlLayout> layouts;
 };
@@ -330,6 +334,10 @@ std::wstring FormatTarget(system_clock::time_point target) {
   std::wcsftime(buffer, std::size(buffer), L"%m/%d %H:%M", &local);
   return std::wstring(today ? L"今日 " : L"明日 ") + buffer;
 }
+system_clock::time_point ReservationTarget() {
+  const auto now = system_clock::now();
+  return now + g_app.timer.Remaining(now);
+}
 std::wstring FormatRemaining(system_clock::duration duration, bool immediate) {
   const auto total = std::max<long long>(0, ceil<seconds>(duration).count());
   if (immediate) return std::to_wstring(total);
@@ -428,10 +436,10 @@ void RefreshUi() {
     SetControlText(Control(IdActiveHeading), executing ? reservedName + L"を実行しています…"
         : immediate ? reservedName + L"まで、あと" : reservedName + L"を予約しました");
     SetControlText(Control(IdCountdown), executing ? L"…"
-        : FormatRemaining(g_app.timer.target() - system_clock::now(), immediate));
+        : FormatRemaining(g_app.timer.Remaining(system_clock::now()), immediate));
     SetControlText(Control(IdActiveTarget), executing ? L"Windowsに" + reservedName + L"を要求しています"
         : immediate ? L"秒後に" + reservedName + L"します\r\n今なら取り消せます。"
-        : FormatTarget(g_app.timer.target()) + L" に" + reservedName + L"\r\nそれまで、ゆっくりどうぞ。");
+        : FormatTarget(ReservationTarget()) + L" に" + reservedName + L"\r\nそれまで、ゆっくりどうぞ。");
     SetControlText(Control(IdCancel), immediate ? reservedName + L"を取り消す (&C)" : L"予約を取り消す (&C)");
   }
   int selectionIndex = 0;
@@ -461,23 +469,30 @@ void ClearErrors() {
 bool ConfirmReplacement(system_clock::time_point target, bool immediate) {
   if (!g_app.timer.HasActiveTimer()) return true;
   if (g_app.confirmationOpen) return false;
-  const std::wstring text = L"現在の予約：" + FormatTarget(g_app.timer.target()) + L" に" + PowerName(g_app.reservedPower) + L"\n新しい予約：" +
+  const auto generation = g_app.powerTransitionGeneration;
+  const std::wstring text = L"現在の予約：" + FormatTarget(ReservationTarget()) + L" に" + PowerName(g_app.reservedPower) + L"\n新しい予約：" +
       (immediate ? std::wstring(L"5秒後") : FormatTarget(target)) + L" に" + PowerName(g_app.selectedPower) + L"\n\n現在の予約を置き換えますか？";
   g_app.confirmationOpen = true;
   const int answer = MessageBoxW(g_app.window, text.c_str(), L"予約の変更",
                                 MB_OKCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2);
   g_app.confirmationOpen = false;
-  return answer == IDOK && IsWindow(g_app.window) && g_app.timer.state() != mouneru::TimerState::Executing;
+  return answer == IDOK && IsWindow(g_app.window) && !g_app.systemSuspended &&
+      generation == g_app.powerTransitionGeneration &&
+      g_app.timer.state() != mouneru::TimerState::Executing;
 }
 void StartReviewedReservation(system_clock::time_point reviewedTarget) {
-  const auto target = g_app.mode == InputMode::Minutes ? InputTarget()
-      : std::optional<system_clock::time_point>{reviewedTarget};
-  if (!target || *target <= system_clock::now()) {
+  if (g_app.systemSuspended) return;
+  const auto now = system_clock::now();
+  const auto minutesValue = ReadInteger(Control(IdMinutes));
+  if (g_app.mode == InputMode::Clock && reviewedTarget <= now) {
     SetControlText(Control(IdInputError), L"確認中に時刻を過ぎました。選び直してください。");
     SetFocus(Control(g_app.mode == InputMode::Minutes ? IdMinutes : IdHour));
     return;
   }
-  if (g_app.timer.ScheduleAt(*target, system_clock::now())) {
+  const bool scheduled = g_app.mode == InputMode::Minutes
+      ? minutesValue && g_app.timer.ScheduleAfterMinutes(*minutesValue, now)
+      : g_app.timer.ScheduleAt(reviewedTarget, now);
+  if (scheduled) {
     g_app.reservedPower = g_app.selectedPower;
     g_app.editing = false;
     ClearErrors();
@@ -487,7 +502,7 @@ void StartReviewedReservation(system_clock::time_point reviewedTarget) {
   }
 }
 void ScheduleFromInputs() {
-  if (!EditorVisible() || g_app.confirmationOpen) return;
+  if (g_app.systemSuspended || !EditorVisible() || g_app.confirmationOpen) return;
   auto target = InputTarget();
   if (!target) {
     SetControlText(Control(IdInputError), g_app.mode == InputMode::Minutes
@@ -502,7 +517,7 @@ void ScheduleFromInputs() {
   StartReviewedReservation(*target);
 }
 void HandleCommand(int id) {
-  if (g_app.timer.state() == mouneru::TimerState::Executing || g_app.confirmationOpen) return;
+  if (g_app.systemSuspended || g_app.timer.state() == mouneru::TimerState::Executing || g_app.confirmationOpen) return;
   const bool wasEditorVisible = EditorVisible();
   const InputMode previousMode = g_app.mode;
   switch (id) {
@@ -572,9 +587,15 @@ DWORD WINAPI PowerWorkerProc(LPVOID parameter) {
   return 0;
 }
 void ExecutePower() {
-  if (g_app.powerRequestInFlight) return;
+  if (g_app.powerRequestInFlight || g_app.systemSuspended ||
+      g_app.timer.state() != mouneru::TimerState::Executing) return;
   g_app.powerRequestInFlight = true;
   RefreshUi();
+  if (!IsWindow(g_app.window) || g_app.systemSuspended) {
+    g_app.powerRequestInFlight = false;
+    g_app.timer.CompleteExecution();
+    return;
+  }
   g_app.workerRequest = {g_app.window, g_app.reservedPower};
   const HANDLE worker = CreateThread(nullptr, 0, PowerWorkerProc, &g_app.workerRequest, 0, nullptr);
   if (!worker) {
@@ -585,6 +606,18 @@ void ExecutePower() {
     return;
   }
   CloseHandle(worker);
+}
+void CancelReservationForPowerTransition() {
+  ++g_app.powerTransitionGeneration;
+  const bool hadReservation = g_app.timer.HasActiveTimer();
+  g_app.timer.Cancel();
+  g_app.editing = false;
+  if (hadReservation) {
+    ClearErrors();
+    SetControlText(Control(IdError), L"PCのスリープ・復帰により、予約を取り消しました。");
+  }
+  RefreshUi();
+  InvalidateRect(g_app.window, nullptr, TRUE);
 }
 bool CreateUi(HWND window) {
   g_app.window = window;
@@ -664,7 +697,14 @@ void PaintDecoration(HDC dc) {
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
   switch (message) {
     case WM_CREATE:
-      if (!CreateUi(window) || !SetTimer(window, kTickTimer, kTickIntervalMs, nullptr)) return -1;
+      if (!CreateUi(window)) return -1;
+      g_app.suspendResumeNotification = RegisterSuspendResumeNotification(window, DEVICE_NOTIFY_WINDOW_HANDLE);
+      if (!g_app.suspendResumeNotification) return -1;
+      if (!SetTimer(window, kTickTimer, kTickIntervalMs, nullptr)) {
+        UnregisterSuspendResumeNotification(g_app.suspendResumeNotification);
+        g_app.suspendResumeNotification = nullptr;
+        return -1;
+      }
       return 0;
     case WM_DPICHANGED: {
       const auto suggested = reinterpret_cast<const RECT*>(lParam);
@@ -674,7 +714,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
       return 0;
     }
     case WM_TIMER:
-      if (wParam == kTickTimer) {
+      if (wParam == kTickTimer && !g_app.systemSuspended) {
         if (g_app.timer.Tick(system_clock::now()) == mouneru::TimerAction::RequestSleep) ExecutePower();
         else RefreshUi();
       }
@@ -692,8 +732,19 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
       }
       return 0;
     case WM_POWERBROADCAST:
-      if (wParam == PBT_APMSUSPEND && g_app.powerRequestInFlight &&
-          g_app.reservedPower == mouneru::PowerAction::Sleep) DestroyWindow(window);
+      if (wParam == PBT_APMSUSPEND) {
+        g_app.systemSuspended = true;
+        if (g_app.powerRequestInFlight && g_app.reservedPower == mouneru::PowerAction::Sleep)
+          DestroyWindow(window);
+        else CancelReservationForPowerTransition();
+      } else if (wParam == PBT_APMRESUMEAUTOMATIC) {
+        g_app.systemSuspended = false;
+        // Also cancel on resume in case the suspend notification was missed.
+        CancelReservationForPowerTransition();
+      } else if (wParam == PBT_APMRESUMESUSPEND && g_app.systemSuspended) {
+        g_app.systemSuspended = false;
+        CancelReservationForPowerTransition();
+      }
       return TRUE;
     case WM_DRAWITEM:
       if (wParam == IdLogo) DrawLogo(*reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
@@ -742,7 +793,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
       if (g_app.powerRequestInFlight || g_app.confirmationOpen) return 0;
       if (g_app.timer.HasActiveTimer()) {
         g_app.confirmationOpen = true;
-        const std::wstring text = L"予約を取り消して終了しますか？\n\n実行予定：" + FormatTarget(g_app.timer.target());
+        const std::wstring text = L"予約を取り消して終了しますか？\n\n実行予定：" + FormatTarget(ReservationTarget());
         const int answer = MessageBoxW(window, text.c_str(), L"もう寝るを終了",
                                       MB_OKCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2);
         g_app.confirmationOpen = false;
@@ -752,6 +803,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
       return 0;
     case WM_DESTROY:
       KillTimer(window, kTickTimer);
+      if (g_app.suspendResumeNotification) {
+        UnregisterSuspendResumeNotification(g_app.suspendResumeNotification);
+        g_app.suspendResumeNotification = nullptr;
+      }
       for (HFONT& font : g_app.fonts) { if (font) DeleteObject(font); font = nullptr; }
       if (g_app.paperBrush) DeleteObject(g_app.paperBrush);
       g_app.paperBrush = nullptr;
@@ -789,6 +844,20 @@ HWND CreateAppWindow(HINSTANCE instance) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+  const mouneru::SingleInstance singleInstance;
+  if (singleInstance.state() == mouneru::InstanceState::AlreadyRunning) {
+    if (HWND existing = FindWindowW(kWindowClass, nullptr)) {
+      ShowWindow(existing, IsIconic(existing) ? SW_RESTORE : SW_SHOW);
+      SetForegroundWindow(existing);
+    }
+    return 0;
+  }
+  if (singleInstance.state() == mouneru::InstanceState::Failed) {
+    const std::wstring text = L"起動状態を確認できないため、開始できませんでした（エラー " +
+        std::to_wstring(singleInstance.error_code()) + L"）。";
+    MessageBoxW(nullptr, text.c_str(), L"もう寝る", MB_OK | MB_ICONERROR);
+    return 1;
+  }
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES};

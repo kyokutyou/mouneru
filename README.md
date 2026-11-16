@@ -8,9 +8,9 @@ Windows 11用の、インストール不要で軽量な電源タイマーです�
 
 ## ダウンロード・起動
 
-配布バージョンは **1.2.0** です。GitHub Releasesで配布する `MouNeru-1.2.0.zip` を展開し、`MouNeru.exe` を開くと使えます。インストールや追加ランタイムは不要です。
+配布バージョンは **1.2.1** です。GitHub Releasesで配布する `MouNeru-1.2.1.zip` を展開し、`MouNeru.exe` を開くと使えます。インストールや追加ランタイムは不要です。
 
-1.2.0の配布用EXEはコード署名なしです。Windowsが警告を表示する場合があります。配布するZIPのSHA-256ファイルでダウンロードしたZIPを確認でき、同梱の `MouNeru.exe.sha256` でEXEを確認できます。
+1.2.1の配布用EXEはコード署名なしです。Windowsが警告を表示する場合があります。配布するZIPのSHA-256ファイルでダウンロードしたZIPを確認でき、同梱の `MouNeru.exe.sha256` でEXEを確認できます。
 
 ## 使い方
 
@@ -35,6 +35,12 @@ Tabで移動、分数・時刻の入力欄でEnterを押すと予約します。
 - 設定保存、ネットワーク通信、管理者権限は不要
 
 予約はアプリが起動している間だけ有効です。アプリやPCを再起動すると復元されません。
+
+PCを別の操作でスリープ・休止状態にした場合も、未実行の予約は取り消します。復帰後に古い予約を実行することはありません。再び実行したい場合は、新しく予約してください。予約の変更を確認している間にスリープした場合も、その確認から予約を復元しません。
+
+同時に起動できるのは1つだけです。もう一度EXEを開くと、起動中の画面を表示します。別のプロセスに予約を作ることはありません。
+
+「何分後に」と「今すぐ」の5秒は経過時間で計測するため、Windowsの時計変更では早まったり延びたりしません。「時刻を指定」はWindowsの時計に従います。
 
 ## 動作環境
 
@@ -66,7 +72,7 @@ Release版は静的C/C++ランタイムを使用するため、`MouNeru.exe`単�
 
 ## リリース成果物
 
-配布ZIPは `MouNeru-1.2.0.zip`、ZIPのチェックサムは `MouNeru-1.2.0.zip.sha256` です。EXEやZIPはソースリポジトリに含めず、GitHub Releasesの添付ファイルとして配布します。
+配布ZIPは `MouNeru-1.2.1.zip`、ZIPのチェックサムは `MouNeru-1.2.1.zip.sha256` です。EXEやZIPはソースリポジトリに含めず、GitHub Releasesの添付ファイルとして配布します。
 
 現在の配布用EXEは署名なしです。署名済みEXEを作成する場合は [SIGNING.md](SIGNING.md) の手順を確認し、署名後にSHA-256チェックサムを生成します。
 
@@ -86,17 +92,18 @@ Get-FileHash .\build\Release\MouNeru.exe -Algorithm SHA256 |
 ビルド後、配布用フォルダへインストールできます。配布用READMEには `packaging/README.md` を使用します。
 
 ```powershell
-cmake --install build --config Release --prefix out/MouNeru-1.2.0
-Compress-Archive -Path .\out\MouNeru-1.2.0\* -DestinationPath .\out\MouNeru-1.2.0.zip -Force
-Get-FileHash .\out\MouNeru-1.2.0.zip -Algorithm SHA256 |
-  ForEach-Object { "$($_.Hash.ToLower())  MouNeru-1.2.0.zip" } |
-  Set-Content -Encoding ascii .\out\MouNeru-1.2.0.zip.sha256
+cmake --install build --config Release --prefix out/MouNeru-1.2.1
+Compress-Archive -Path .\out\MouNeru-1.2.1\* -DestinationPath .\out\MouNeru-1.2.1.zip -Force
+Get-FileHash .\out\MouNeru-1.2.1.zip -Algorithm SHA256 |
+  ForEach-Object { "$($_.Hash.ToLower())  MouNeru-1.2.1.zip" } |
+  Set-Content -Encoding ascii .\out\MouNeru-1.2.1.zip.sha256
 ```
 
 配布フォルダは上記の4ファイルだけの状態で梱包してください。
 
 ## 更新履歴
 
+- **1.2.1**：スリープ・復帰時に未実行の予約を取り消し、複数起動を防止しました。分数タイマーと5秒カウントダウンがWindowsの時計変更に影響される不具合を修正しました。
 - **1.2.0**：スリープ／シャットダウンの選択欄と、アプリ終了時に予約が取り消される説明を追加しました。
 - **1.1.2**：Enterの長押しで予約や5秒カウントダウンが意図せず取り消される不具合を修正しました。
 - **1.1.1**：＋／－の連打の取りこぼし、マウス操作時の四角いフォーカス枠、マウス移動時の点滅を修正しました。
